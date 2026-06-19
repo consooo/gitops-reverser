@@ -431,7 +431,7 @@ func parseFlagsWithArgs(fs *flag.FlagSet, args []string) (appConfig, error) {
 		"Committer display name used for commits in watch mode. Ignored in audit mode.")
 	fs.StringVar(&cfg.watchModeCommitterEmail, "watch-mode-committer-email", "",
 		"Committer email used for commits in watch mode. Ignored in audit mode. "+
-			"Defaults to <committer-name>@gitops-reverser.local when empty.")
+			"Defaults to <committer-name>@noreply.cluster.local when empty.")
 	fs.DurationVar(&cfg.watchModeReconcileInterval, "watch-mode-reconcile-interval", 10*time.Minute,
 		"Interval at which a forced full re-snapshot is triggered in watch mode to self-heal missed informer events. "+
 			"Set to 0 to disable. Ignored in audit mode.")
@@ -608,7 +608,7 @@ func validateAuditConfig(cfg appConfig) error {
 // buildWatchModeCommitter constructs the git.UserInfo used as the commit author in watch mode.
 // Username is required for the author to be distinct from the operator committer; DisplayName
 // mirrors it so git shows the human-readable name. Email is optional — authorEmail() in the git
-// package falls back to ConstructSafeEmail(username, "cluster.local") when empty.
+// package falls back to ConstructSafeEmail(username, "cluster.local") when it is empty or invalid.
 func buildWatchModeCommitter(cfg appConfig) git.UserInfo {
 	return git.UserInfo{
 		Username:    cfg.watchModeCommitterName,

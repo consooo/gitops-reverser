@@ -87,6 +87,10 @@ spec:
             - --audit-event-body-wait={{ .Values.auditEventJoin.bodyWait }}
             - --capture-mode={{ .Values.captureMode }}
             - --watch-mode-reconcile-interval={{ .Values.watchModeReconcileInterval }}
+            - --watch-mode-committer-name={{ .Values.watchModeCommitterName }}
+            {{- if .Values.watchModeCommitterEmail }}
+            - --watch-mode-committer-email={{ .Values.watchModeCommitterEmail }}
+            {{- end }}
             {{- if .Values.logging.level }}
             - --zap-log-level={{ .Values.logging.level }}
             {{- end }}

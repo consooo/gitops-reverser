@@ -47,7 +47,7 @@ events carry no actor identity. All commits use the bot identity configured by
 ```yaml
 captureMode: watch                         # switch to watch mode
 watchModeCommitterName: gitops-reverser    # optional: custom bot name
-watchModeCommitterEmail: ""                # optional: defaults to <name>@gitops-reverser.local
+watchModeCommitterEmail: ""                # optional: defaults to <name>@noreply.cluster.local
 watchModeReconcileInterval: 10m            # optional: periodic full re-snapshot to self-heal missed events
 ```
 

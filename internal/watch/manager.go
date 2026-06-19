@@ -73,8 +73,8 @@ type Manager struct {
 	// Watchers still support discovery and snapshot/reconcile flows.
 	AuditLiveEventsEnabled bool
 	// WatchModeCommitter is the author/committer identity used for commits generated from
-	// informer events (capture-mode=watch). Falls back to an empty UserInfo (which uses
-	// the GitProvider committer config) when both fields are empty.
+	// informer events (capture-mode=watch). When Email is empty the git package falls back
+	// to ConstructSafeEmail(Username, "cluster.local").
 	WatchModeCommitter git.UserInfo
 	// WatchModeReconcileInterval is the period at which a forced full re-snapshot is
 	// triggered in watch mode to self-heal any events missed by the informers (restart,
@@ -233,7 +233,7 @@ func (m *Manager) Start(ctx context.Context) error {
 		t := time.NewTicker(m.WatchModeReconcileInterval)
 		defer t.Stop()
 		watchPeriodicC = t.C
-		log.Info("Watch mode periodic reconciliation enabled", "interval", m.WatchModeReconcileInterval)
+		log.Info("Watch mode periodic reconciliation enabled", "interval", m.WatchModeReconcileInterval.String())
 	}
 
 	for {
@@ -249,7 +249,7 @@ func (m *Manager) Start(ctx context.Context) error {
 			}
 
 		case <-watchPeriodicC:
-			log.Info("Watch mode periodic reconciliation triggered", "interval", m.WatchModeReconcileInterval)
+			log.Info("Watch mode periodic reconciliation triggered", "interval", m.WatchModeReconcileInterval.String())
 			m.resetDeliveredRuleSetHashes()
 			if err := m.ReconcileForRuleChange(ctx); err != nil {
 				log.Error(err, "Watch mode periodic reconciliation failed")

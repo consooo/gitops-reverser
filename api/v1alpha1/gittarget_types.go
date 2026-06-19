@@ -88,6 +88,11 @@ type GitTargetStatus struct {
 	// Snapshot captures the latest initial snapshot reconciliation details.
 	// +optional
 	Snapshot *GitTargetSnapshotStatus `json:"snapshot,omitempty"`
+
+	// CaptureMode reflects the operator-level event capture mode active for this GitTarget.
+	// Will be either "audit" or "watch".
+	// +optional
+	CaptureMode string `json:"captureMode,omitempty"`
 }
 
 // GitTargetSnapshotStatus captures initial snapshot progress details.

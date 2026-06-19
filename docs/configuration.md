@@ -13,6 +13,43 @@ The short version:
 The chart's optional `quickstart` values are just a convenience layer that creates starter
 instances of those same resources.
 
+## Capture mode
+
+gitops-reverser supports two event capture modes, configured with the `--capture-mode` operator
+flag (Helm value `captureMode`):
+
+| Mode | Flag value | Requires | Commit author |
+|---|---|---|---|
+| **Audit** (default) | `audit` | kube-apiserver audit webhook + Valkey/Redis | Real Kubernetes user |
+| **Watch** | `watch` | Nothing extra | Configurable bot identity |
+
+### `audit` (default)
+
+The kube-apiserver delivers audit events to the operator's webhook. The event carries the
+real end-user identity, so commits attribute changes to the actual actor. A Valkey/Redis
+sidecar is required to buffer events between the webhook and the processing pipeline.
+
+This is the recommended mode when you have access to kube-apiserver audit webhook configuration.
+
+### `watch`
+
+The operator uses controller-runtime informers (List+Watch) as the live event source. No
+kube-apiserver flags or Valkey/Redis sidecar are required. This makes it possible to get started
+on managed control planes (GKE, EKS, AKS) where audit webhook configuration is restricted.
+
+The trade-off: commits cannot attribute changes to the real Kubernetes user because informer
+events carry no actor identity. All commits use the bot identity configured by
+`--watch-mode-committer-name` / `--watch-mode-committer-email` (Helm values
+`watchModeCommitterName` / `watchModeCommitterEmail`, defaulting to `gitops-reverser-watch`).
+
+**Helm snippet:**
+
+```yaml
+captureMode: watch                         # switch to watch mode
+watchModeCommitterName: gitops-reverser    # optional: custom bot name
+watchModeCommitterEmail: ""                # optional: defaults to <name>@gitops-reverser.local
+```
+
 ## Additional sensitive resources
 
 Core Kubernetes `Secret` resources always use the encrypted Git write path. For a Secret-shaped

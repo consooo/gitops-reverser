@@ -408,6 +408,81 @@ func TestHandleEvent_NamespacedWatchRuleRoutesOwnNamespaceObject(t *testing.T) {
 	}
 }
 
+func TestHandleEvent_WatchModeRoutesWithWatchModeCommitter(t *testing.T) {
+	// In watch mode (AuditLiveEventsEnabled=false), informer events must be
+	// routed to the event stream using Manager.WatchModeCommitter as the UserInfo.
+	initWatchMetricsOnce.Do(func() {
+		_, _ = telemetry.InitOTLPExporter(context.Background())
+	})
+
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add core scheme: %v", err)
+	}
+	if err := configv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add api scheme: %v", err)
+	}
+
+	store := rulestore.NewStore()
+	store.AddOrUpdateWatchRule(
+		configv1alpha1.WatchRule{
+			ObjectMeta: metav1.ObjectMeta{Name: "wr", Namespace: "default"},
+			Spec: configv1alpha1.WatchRuleSpec{
+				TargetRef: configv1alpha1.LocalTargetReference{Name: "target"},
+				Rules: []configv1alpha1.ResourceRule{{
+					APIGroups:   []string{""},
+					APIVersions: []string{"v1"},
+					Resources:   []string{"configmaps"},
+					Operations:  []configv1alpha1.OperationType{configv1alpha1.OperationAll},
+				}},
+			},
+		},
+		"target", "default", "provider", "default", "main", "state",
+	)
+
+	router := &EventRouter{
+		Log:              logr.Discard(),
+		gitTargetStreams: make(map[string]*reconcile.GitTargetEventStream),
+	}
+	enqueuer := &recordingEnqueuer{}
+	stream := reconcile.NewGitTargetEventStream("target", "default", enqueuer, logr.Discard())
+	stream.OnReconciliationComplete()
+	gitDest := itypes.NewResourceReference("target", "default")
+	router.RegisterGitTargetEventStream(gitDest, stream)
+
+	fakeK8s := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}).
+		Build()
+
+	watchCommitter := git.UserInfo{
+		Username:    "gitops-reverser-watch",
+		DisplayName: "gitops-reverser-watch",
+		Email:       "watch@gitops-reverser.local",
+	}
+	manager := &Manager{
+		Client:                 fakeK8s,
+		Log:                    logr.Discard(),
+		RuleStore:              store,
+		EventRouter:            router,
+		AuditLiveEventsEnabled: false,
+		WatchModeCommitter:     watchCommitter,
+	}
+
+	obj := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cm-watch", Namespace: "default"},
+		Data:       map[string]string{"key": "value"},
+	}
+	manager.handleEvent(obj, GVR{Group: "", Version: "v1", Resource: "configmaps"}, configv1alpha1.OperationCreate)
+
+	if len(enqueuer.events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(enqueuer.events))
+	}
+	if enqueuer.events[0].UserInfo != watchCommitter {
+		t.Fatalf("expected UserInfo %+v, got %+v", watchCommitter, enqueuer.events[0].UserInfo)
+	}
+}
+
 func TestHandleEvent_MixedRules_OnlyClusterWatchRuleMatchesForeignNamespace(t *testing.T) {
 	initWatchMetricsOnce.Do(func() {
 		_, _ = telemetry.InitOTLPExporter(context.Background())

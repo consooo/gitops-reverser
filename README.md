@@ -41,9 +41,10 @@ simpler for other teams.
 
 | Good fit | Poor fit |
 |---|---|
-| Self-managed clusters where you can configure kube-apiserver audit delivery | Managed control planes that do not expose audit webhook configuration |
-| API-first or hybrid teams that still want Git history | Shared paths with two always-on writers fighting over the same resources |
-| Brownfield discovery, hotfix capture, migration toward GitOps | Production HA requirements today |
+| Self-managed clusters where you can configure kube-apiserver audit delivery | Shared paths with two always-on writers fighting over the same resources |
+| Managed control planes (GKE/EKS/AKS) using `--capture-mode=watch` | Production HA requirements today |
+| API-first or hybrid teams that still want Git history | Needing per-user commit attribution in managed-cluster watch mode |
+| Brownfield discovery, hotfix capture, migration toward GitOps | |
 
 ## How it works
 

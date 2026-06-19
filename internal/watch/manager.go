@@ -47,6 +47,7 @@ import (
 
 	configv1alpha1 "github.com/ConfigButler/gitops-reverser/api/v1alpha1"
 	"github.com/ConfigButler/gitops-reverser/internal/events"
+	"github.com/ConfigButler/gitops-reverser/internal/git"
 	"github.com/ConfigButler/gitops-reverser/internal/rulestore"
 	"github.com/ConfigButler/gitops-reverser/internal/sanitize"
 	"github.com/ConfigButler/gitops-reverser/internal/telemetry"
@@ -71,6 +72,10 @@ type Manager struct {
 	// AuditLiveEventsEnabled makes the audit pipeline authoritative for live mutating events.
 	// Watchers still support discovery and snapshot/reconcile flows.
 	AuditLiveEventsEnabled bool
+	// WatchModeCommitter is the author/committer identity used for commits generated from
+	// informer events (capture-mode=watch). Falls back to an empty UserInfo (which uses
+	// the GitProvider committer config) when both fields are empty.
+	WatchModeCommitter git.UserInfo
 	// Deduplication: tracks last seen content hash per resource to skip status-only changes
 	lastSeenMu   sync.RWMutex
 	lastSeenHash map[string]uint64 // resourceKey → content hash (key uses types.ResourceIdentifier.Key)

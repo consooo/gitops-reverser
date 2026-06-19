@@ -94,7 +94,7 @@ func (m *Manager) handleEvent(obj interface{}, g GVR, op configv1alpha1.Operatio
 		return
 	}
 
-	userInfo := git.UserInfo{} // username not available from watch path
+	userInfo := m.WatchModeCommitter
 
 	// Count each watched object processed by the informer path.
 	telemetry.ObjectsScannedTotal.Add(ctx, 1)

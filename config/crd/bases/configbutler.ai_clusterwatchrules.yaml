@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.19.0
+    controller-gen.kubebuilder.io/version: v0.21.0
   name: clusterwatchrules.configbutler.ai
 spec:
   group: configbutler.ai
@@ -139,13 +139,6 @@ spec:
                       minItems: 1
                       type: array
                     scope:
-                      allOf:
-                      - enum:
-                        - Cluster
-                        - Namespaced
-                      - enum:
-                        - Cluster
-                        - Namespaced
                       description: |-
                         Scope defines whether this rule watches Cluster-scoped or Namespaced resources.
                         - "Cluster": For cluster-scoped resources (Nodes, ClusterRoles, CRDs, etc.).
@@ -153,6 +146,9 @@ spec:
                         - "Namespaced": For namespaced resources (Pods, Deployments, Secrets, etc.).
                                         Optionally filtered by namespaceSelector.
                                         If namespaceSelector is omitted, watches resources in ALL namespaces.
+                      enum:
+                      - Cluster
+                      - Namespaced
                       type: string
                   required:
                   - resources

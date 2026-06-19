@@ -43,6 +43,7 @@ func TestParseFlagsWithArgs_Defaults(t *testing.T) {
 	cfg, err := parseFlagsWithArgs(fs, []string{})
 	require.NoError(t, err)
 
+	assert.Equal(t, captureModeAudit, cfg.captureMode)
 	assert.False(t, cfg.metricsInsecure)
 	assert.False(t, cfg.auditInsecure)
 	assert.Equal(t, "0.0.0.0", cfg.auditListenAddress)
@@ -64,6 +65,92 @@ func TestParseFlagsWithArgs_Defaults(t *testing.T) {
 	assert.Equal(t, 500*time.Millisecond, cfg.auditEventBodyWait)
 	assert.False(t, cfg.zapOpts.Development)
 	assert.Equal(t, []string{"secrets"}, cfg.sensitiveResources.Entries())
+}
+
+func TestParseFlagsWithArgs_CaptureModeWatch(t *testing.T) {
+	fs := flag.NewFlagSet("test-watch-mode", flag.ContinueOnError)
+	cfg, err := parseFlagsWithArgs(fs, []string{"--capture-mode=watch"})
+	require.NoError(t, err)
+	assert.Equal(t, captureModeWatch, cfg.captureMode)
+}
+
+func TestParseFlagsWithArgs_CaptureModeInvalid(t *testing.T) {
+	fs := flag.NewFlagSet("test-invalid-mode", flag.ContinueOnError)
+	_, err := parseFlagsWithArgs(fs, []string{"--capture-mode=stream"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "capture-mode")
+}
+
+func TestParseFlagsWithArgs_WatchModeSkipsAuditValidation(t *testing.T) {
+	// In watch mode, audit-specific flags like redis addr and client CA are not required.
+	fs := flag.NewFlagSet("test-watch-no-audit", flag.ContinueOnError)
+	cfg, err := parseFlagsWithArgs(fs, []string{
+		"--capture-mode=watch",
+		"--audit-redis-addr=",
+		"--audit-client-ca-path=",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, captureModeWatch, cfg.captureMode)
+}
+
+func TestParseFlagsWithArgs_WatchModeCommitterDefaults(t *testing.T) {
+	fs := flag.NewFlagSet("test-watch-committer-defaults", flag.ContinueOnError)
+	cfg, err := parseFlagsWithArgs(fs, []string{"--capture-mode=watch"})
+	require.NoError(t, err)
+	assert.Equal(t, "gitops-reverser-watch", cfg.watchModeCommitterName)
+	assert.Empty(t, cfg.watchModeCommitterEmail)
+}
+
+func TestParseFlagsWithArgs_WatchModeCommitterCustom(t *testing.T) {
+	fs := flag.NewFlagSet("test-watch-committer-custom", flag.ContinueOnError)
+	cfg, err := parseFlagsWithArgs(fs, []string{
+		"--capture-mode=watch",
+		"--watch-mode-committer-name=my-bot",
+		"--watch-mode-committer-email=my-bot@example.com",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "my-bot", cfg.watchModeCommitterName)
+	assert.Equal(t, "my-bot@example.com", cfg.watchModeCommitterEmail)
+}
+
+func TestBuildWatchModeCommitter(t *testing.T) {
+	tests := []struct {
+		name           string
+		committerName  string
+		committerEmail string
+		wantUsername   string
+		wantDisplay    string
+		wantEmail      string
+	}{
+		{
+			name:           "defaults",
+			committerName:  "gitops-reverser-watch",
+			committerEmail: "",
+			wantUsername:   "gitops-reverser-watch",
+			wantDisplay:    "gitops-reverser-watch",
+			wantEmail:      "",
+		},
+		{
+			name:           "custom name and email",
+			committerName:  "my-bot",
+			committerEmail: "my-bot@example.com",
+			wantUsername:   "my-bot",
+			wantDisplay:    "my-bot",
+			wantEmail:      "my-bot@example.com",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := appConfig{
+				watchModeCommitterName:  tc.committerName,
+				watchModeCommitterEmail: tc.committerEmail,
+			}
+			u := buildWatchModeCommitter(cfg)
+			assert.Equal(t, tc.wantUsername, u.Username)
+			assert.Equal(t, tc.wantDisplay, u.DisplayName)
+			assert.Equal(t, tc.wantEmail, u.Email)
+		})
+	}
 }
 
 func TestParseFlagsWithArgs_AuditUnsecure(t *testing.T) {

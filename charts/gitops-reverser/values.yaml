@@ -50,6 +50,12 @@ securityContext:
   runAsNonRoot: true
   runAsUser: 65532
 
+# Capture mode controls the event source for live mutations.
+# 'audit' (default): requires kube-apiserver audit webhook delivery and Valkey; commits include real author attribution.
+# 'watch': uses Kubernetes informers only; works on any cluster with no kube-apiserver flags or Valkey needed,
+#          but commits use the GitProvider committer identity — real end-user attribution is not available.
+captureMode: audit
+
 # Controller manager configuration
 controllerManager:
   # Health probe configuration

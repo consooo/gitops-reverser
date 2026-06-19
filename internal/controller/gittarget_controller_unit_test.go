@@ -28,6 +28,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	configbutleraiv1alpha1 "github.com/ConfigButler/gitops-reverser/api/v1alpha1"
+	"github.com/ConfigButler/gitops-reverser/internal/git"
+	"github.com/ConfigButler/gitops-reverser/internal/reconcile"
+	"github.com/ConfigButler/gitops-reverser/internal/watch"
 )
 
 func noopLogger() logr.Logger { return logr.Discard() }
@@ -157,4 +160,30 @@ func TestEvaluateSnapshotGate_RunsWhenSnapshotNotSynced(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, metav1.ConditionTrue, state)
+}
+
+// nopEnqueuer satisfies reconcile.EventEnqueuer for tests that do not care about events.
+type nopEnqueuer struct{}
+
+func (n *nopEnqueuer) Enqueue(_ git.Event)                {}
+func (n *nopEnqueuer) EnqueueRequest(_ *git.WriteRequest) {}
+
+// TestEvaluateEventStreamGate_WatchModeSkipsAuditGate verifies that a stream starting
+// in RECONCILING state transitions to LIVE_PROCESSING through evaluateEventStreamGate
+// without requiring an audit consumer to signal readiness — the essential watch-mode enabler.
+func TestEvaluateEventStreamGate_WatchModeSkipsAuditGate(t *testing.T) {
+	reconciler := &GitTargetReconciler{
+		EventRouter: &watch.EventRouter{},
+	}
+	stream := reconcile.NewGitTargetEventStream("target", "default", &nopEnqueuer{}, noopLogger())
+	require.Equal(t, reconcile.Reconciling, stream.GetState(), "stream must start in RECONCILING")
+
+	target := &configbutleraiv1alpha1.GitTarget{
+		ObjectMeta: metav1.ObjectMeta{Name: "target", Namespace: "default"},
+	}
+	ready, msg := reconciler.evaluateEventStreamGate(target, stream, "default")
+
+	assert.True(t, ready)
+	assert.Empty(t, msg)
+	assert.Equal(t, reconcile.LiveProcessing, stream.GetState())
 }

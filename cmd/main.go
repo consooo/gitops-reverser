@@ -99,7 +99,9 @@ func main() {
 		"buildDate", bi.BuildDate,
 		"goVersion", bi.GoVersion)
 
-	if cfg.auditRedisPassword == "" {
+	setupLog.Info("Capture mode", "mode", cfg.captureMode)
+
+	if cfg.captureMode == captureModeAudit && cfg.auditRedisPassword == "" {
 		setupLog.Info(
 			"no Redis password configured — "+
 				"connecting to Valkey without authentication is not recommended for production deployments",
@@ -161,7 +163,8 @@ func main() {
 		Log:                    ctrl.Log.WithName("watch"),
 		RuleStore:              ruleStore,
 		EventRouter:            nil, // Will be set below
-		AuditLiveEventsEnabled: true,
+		AuditLiveEventsEnabled: cfg.captureMode == captureModeAudit,
+		WatchModeCommitter:     buildWatchModeCommitter(cfg),
 	}
 
 	// Initialize EventRouter with all dependencies
@@ -194,126 +197,130 @@ func main() {
 		WatchManager: watchMgr,
 	}).SetupWithManager(mgr), "unable to create controller", "controller", "ClusterWatchRule")
 
-	// Register audit webhook receiver for metrics collection
-	auditQueue, err := queue.NewRedisAuditQueue(queue.RedisAuditQueueConfig{
-		Addr:       cfg.auditRedisAddr,
-		Username:   cfg.auditRedisUsername,
-		AuthValue:  cfg.auditRedisPassword,
-		DB:         cfg.auditRedisDB,
-		Stream:     cfg.auditRedisStream,
-		MaxLen:     cfg.auditRedisMaxLen,
-		TLSEnabled: cfg.auditRedisTLS,
-	})
-	fatalIfErr(err, "unable to initialize audit redis queue")
-
-	var auditDebugQueue webhookhandler.AuditDebugEventQueue
-	if cfg.auditDebugRedisStream != "" {
-		auditDebugQueue, err = queue.NewRedisAuditDebugQueue(queue.RedisAuditQueueConfig{
-			Addr:       cfg.auditRedisAddr,
-			Username:   cfg.auditRedisUsername,
-			AuthValue:  cfg.auditRedisPassword,
-			DB:         cfg.auditRedisDB,
-			Stream:     cfg.auditDebugRedisStream,
-			MaxLen:     cfg.auditDebugRedisMaxLen,
-			TLSEnabled: cfg.auditRedisTLS,
-		})
-		fatalIfErr(err, "unable to initialize audit debug redis queue")
-	}
-
-	auditJoiner, err := webhookhandler.NewRedisAuditEventJoiner(webhookhandler.RedisAuditJoinerConfig{
-		Addr:             cfg.auditRedisAddr,
-		Username:         cfg.auditRedisUsername,
-		AuthValue:        cfg.auditRedisPassword,
-		DB:               cfg.auditRedisDB,
-		TLSEnabled:       cfg.auditRedisTLS,
-		BodyTTL:          cfg.auditEventBodyTTL,
-		DecisionTTL:      cfg.auditEventDecisionTTL,
-		OfficialBodyWait: cfg.auditEventBodyWait,
-	})
-	fatalIfErr(err, "unable to initialize audit event joiner")
-	setupLog.Info("Audit pipeline configured",
-		"redisAddress", cfg.auditRedisAddr,
-		"stream", cfg.auditRedisStream,
-		"debugStream", cfg.auditDebugRedisStream,
-		"db", cfg.auditRedisDB,
-		"tlsEnabled", cfg.auditRedisTLS,
-		"bodyTTL", cfg.auditEventBodyTTL,
-		"decisionTTL", cfg.auditEventDecisionTTL,
-		"officialBodyWait", cfg.auditEventBodyWait,
-		"redisMaxLen", cfg.auditRedisMaxLen,
-		"debugRedisMaxLen", cfg.auditDebugRedisMaxLen)
-
-	if cfg.auditRedisMaxLen == 0 {
-		setupLog.Info(
-			"audit redis stream max length is 0; queue retention is unbounded — "+
-				"Valkey/Redis memory and restart/reload time can grow without limit. "+
-				"Set --audit-redis-max-len (queue.redis.maxLen in the Helm chart) to a bounded value.",
-			"stream", cfg.auditRedisStream,
-		)
-	}
-	if cfg.auditDebugRedisStream != "" && cfg.auditDebugRedisMaxLen == 0 {
-		setupLog.Info(
-			"audit debug redis stream max length is 0; debug queue retention is unbounded — "+
-				"the debug stream stores every decoded audit event before filtering/joining, "+
-				"so unbounded mode is especially risky. "+
-				"Set --audit-debug-redis-max-len (webhook.audit.debugStream.maxLen in the Helm chart) to a bounded value.",
-			"debugStream", cfg.auditDebugRedisStream,
-		)
-	}
-
-	// Register the audit stream consumer. It shares the same Redis config as the
-	// producer but uses a dedicated consumer group and ID (pod-name-scoped so that
-	// multiple replicas do not share a consumer identity).
-	consumerID := os.Getenv("POD_NAME")
-	if consumerID == "" {
-		consumerID = "gitopsreverser-consumer-0"
-	}
-	queueMetrics, queueMetricsErr := queue.NewMetricsReporter(queue.MetricsConfig{
-		Addr:        cfg.auditRedisAddr,
-		Username:    cfg.auditRedisUsername,
-		AuthValue:   cfg.auditRedisPassword,
-		DB:          cfg.auditRedisDB,
-		TLSEnabled:  cfg.auditRedisTLS,
-		Stream:      cfg.auditRedisStream,
-		DebugStream: cfg.auditDebugRedisStream,
-	}, ctrl.Log.WithName("queue-metrics"))
-	fatalIfErr(queueMetricsErr, "unable to initialize audit queue metrics reporter")
-	fatalIfErr(mgr.Add(queueMetrics), "unable to add audit queue metrics reporter to manager")
-
-	auditConsumer, consumerErr := queue.NewAuditConsumer(
-		queue.AuditConsumerConfig{
+	// Audit pipeline: Redis queue, consumer, and HTTP server.
+	// Skipped entirely in watch mode — no Valkey dependency required.
+	var auditCertWatcher *certwatcher.CertWatcher
+	if cfg.captureMode == captureModeAudit {
+		// Register audit webhook receiver for metrics collection
+		auditQueue, auditQueueErr := queue.NewRedisAuditQueue(queue.RedisAuditQueueConfig{
 			Addr:       cfg.auditRedisAddr,
 			Username:   cfg.auditRedisUsername,
 			AuthValue:  cfg.auditRedisPassword,
 			DB:         cfg.auditRedisDB,
 			Stream:     cfg.auditRedisStream,
+			MaxLen:     cfg.auditRedisMaxLen,
 			TLSEnabled: cfg.auditRedisTLS,
-			ConsumerID: consumerID,
-		},
-		ruleStore,
-		eventRouter,
-		mgr.GetClient(),
-		mgr.GetAPIReader(),
-		ctrl.Log.WithName("audit-consumer"),
-	)
-	fatalIfErr(consumerErr, "unable to initialize audit stream consumer")
-	fatalIfErr(mgr.Add(auditConsumer), "unable to add audit stream consumer to manager")
-	setupLog.Info("Audit stream consumer registered", "consumerID", consumerID)
+		})
+		fatalIfErr(auditQueueErr, "unable to initialize audit redis queue")
 
-	auditHandler, err := webhookhandler.NewAuditHandler(webhookhandler.AuditHandlerConfig{
-		MaxRequestBodyBytes: cfg.auditMaxRequestBodyBytes,
-		Queue:               auditQueue,
-		DebugQueue:          auditDebugQueue,
-		Joiner:              auditJoiner,
-	})
-	fatalIfErr(err, "unable to create audit handler")
+		var auditDebugQueue webhookhandler.AuditDebugEventQueue
+		if cfg.auditDebugRedisStream != "" {
+			var debugQueueErr error
+			auditDebugQueue, debugQueueErr = queue.NewRedisAuditDebugQueue(queue.RedisAuditQueueConfig{
+				Addr:       cfg.auditRedisAddr,
+				Username:   cfg.auditRedisUsername,
+				AuthValue:  cfg.auditRedisPassword,
+				DB:         cfg.auditRedisDB,
+				Stream:     cfg.auditDebugRedisStream,
+				MaxLen:     cfg.auditDebugRedisMaxLen,
+				TLSEnabled: cfg.auditRedisTLS,
+			})
+			fatalIfErr(debugQueueErr, "unable to initialize audit debug redis queue")
+		}
 
-	var auditCertWatcher *certwatcher.CertWatcher
+		auditJoiner, joinerErr := webhookhandler.NewRedisAuditEventJoiner(webhookhandler.RedisAuditJoinerConfig{
+			Addr:             cfg.auditRedisAddr,
+			Username:         cfg.auditRedisUsername,
+			AuthValue:        cfg.auditRedisPassword,
+			DB:               cfg.auditRedisDB,
+			TLSEnabled:       cfg.auditRedisTLS,
+			BodyTTL:          cfg.auditEventBodyTTL,
+			DecisionTTL:      cfg.auditEventDecisionTTL,
+			OfficialBodyWait: cfg.auditEventBodyWait,
+		})
+		fatalIfErr(joinerErr, "unable to initialize audit event joiner")
+		setupLog.Info("Audit pipeline configured",
+			"redisAddress", cfg.auditRedisAddr,
+			"stream", cfg.auditRedisStream,
+			"debugStream", cfg.auditDebugRedisStream,
+			"db", cfg.auditRedisDB,
+			"tlsEnabled", cfg.auditRedisTLS,
+			"bodyTTL", cfg.auditEventBodyTTL,
+			"decisionTTL", cfg.auditEventDecisionTTL,
+			"officialBodyWait", cfg.auditEventBodyWait,
+			"redisMaxLen", cfg.auditRedisMaxLen,
+			"debugRedisMaxLen", cfg.auditDebugRedisMaxLen)
 
-	auditRunnable, watcher, initErr := initAuditServerRunnable(cfg, tlsOpts, auditHandler)
-	fatalIfErr(initErr, "unable to initialize audit ingress server")
-	auditCertWatcher = watcher
-	fatalIfErr(mgr.Add(auditRunnable), "unable to add audit ingress server runnable")
+		if cfg.auditRedisMaxLen == 0 {
+			setupLog.Info(
+				"audit redis stream max length is 0; queue retention is unbounded — "+
+					"Valkey/Redis memory and restart/reload time can grow without limit. "+
+					"Set --audit-redis-max-len (queue.redis.maxLen in the Helm chart) to a bounded value.",
+				"stream", cfg.auditRedisStream,
+			)
+		}
+		if cfg.auditDebugRedisStream != "" && cfg.auditDebugRedisMaxLen == 0 {
+			setupLog.Info(
+				"audit debug redis stream max length is 0; debug queue retention is unbounded — "+
+					"the debug stream stores every decoded audit event before filtering/joining, "+
+					"so unbounded mode is especially risky. "+
+					"Set --audit-debug-redis-max-len (webhook.audit.debugStream.maxLen in the Helm chart) to a bounded value.",
+				"debugStream", cfg.auditDebugRedisStream,
+			)
+		}
+
+		// Register the audit stream consumer. It shares the same Redis config as the
+		// producer but uses a dedicated consumer group and ID (pod-name-scoped so that
+		// multiple replicas do not share a consumer identity).
+		consumerID := os.Getenv("POD_NAME")
+		if consumerID == "" {
+			consumerID = "gitopsreverser-consumer-0"
+		}
+		queueMetrics, queueMetricsErr := queue.NewMetricsReporter(queue.MetricsConfig{
+			Addr:        cfg.auditRedisAddr,
+			Username:    cfg.auditRedisUsername,
+			AuthValue:   cfg.auditRedisPassword,
+			DB:          cfg.auditRedisDB,
+			TLSEnabled:  cfg.auditRedisTLS,
+			Stream:      cfg.auditRedisStream,
+			DebugStream: cfg.auditDebugRedisStream,
+		}, ctrl.Log.WithName("queue-metrics"))
+		fatalIfErr(queueMetricsErr, "unable to initialize audit queue metrics reporter")
+		fatalIfErr(mgr.Add(queueMetrics), "unable to add audit queue metrics reporter to manager")
+
+		auditConsumer, consumerErr := queue.NewAuditConsumer(
+			queue.AuditConsumerConfig{
+				Addr:       cfg.auditRedisAddr,
+				Username:   cfg.auditRedisUsername,
+				AuthValue:  cfg.auditRedisPassword,
+				DB:         cfg.auditRedisDB,
+				Stream:     cfg.auditRedisStream,
+				TLSEnabled: cfg.auditRedisTLS,
+				ConsumerID: consumerID,
+			},
+			ruleStore,
+			eventRouter,
+			mgr.GetClient(),
+			mgr.GetAPIReader(),
+			ctrl.Log.WithName("audit-consumer"),
+		)
+		fatalIfErr(consumerErr, "unable to initialize audit stream consumer")
+		fatalIfErr(mgr.Add(auditConsumer), "unable to add audit stream consumer to manager")
+		setupLog.Info("Audit stream consumer registered", "consumerID", consumerID)
+
+		auditHandler, auditHandlerErr := webhookhandler.NewAuditHandler(webhookhandler.AuditHandlerConfig{
+			MaxRequestBodyBytes: cfg.auditMaxRequestBodyBytes,
+			Queue:               auditQueue,
+			DebugQueue:          auditDebugQueue,
+			Joiner:              auditJoiner,
+		})
+		fatalIfErr(auditHandlerErr, "unable to create audit handler")
+
+		auditRunnable, watcher, initErr := initAuditServerRunnable(cfg, tlsOpts, auditHandler)
+		fatalIfErr(initErr, "unable to initialize audit ingress server")
+		auditCertWatcher = watcher
+		fatalIfErr(mgr.Add(auditRunnable), "unable to add audit ingress server runnable")
+	} // end captureMode == audit
 
 	// Setup watch manager (must be after controllers are set up)
 	fatalIfErr(watchMgr.SetupWithManager(mgr), "unable to setup watch ingestion manager")
@@ -331,6 +338,7 @@ func main() {
 		Scheme:        mgr.GetScheme(),
 		WorkerManager: workerManager,
 		EventRouter:   eventRouter,
+		CaptureMode:   cfg.captureMode,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "GitTarget")
 		os.Exit(1)
@@ -355,8 +363,16 @@ func main() {
 	fatalIfErr(mgr.Start(setupCtx), "problem running manager")
 }
 
+const (
+	captureModeAudit = "audit"
+	captureModeWatch = "watch"
+)
+
 // appConfig holds parsed CLI flags and logging options.
 type appConfig struct {
+	captureMode              string
+	watchModeCommitterName   string
+	watchModeCommitterEmail  string
 	metricsAddr              string
 	metricsCertPath          string
 	metricsCertName          string
@@ -406,6 +422,14 @@ func parseFlags() appConfig {
 func parseFlagsWithArgs(fs *flag.FlagSet, args []string) (appConfig, error) {
 	var cfg appConfig
 
+	fs.StringVar(&cfg.captureMode, "capture-mode", captureModeAudit,
+		"Event capture mode: 'audit' (default, requires kube-apiserver audit webhook + Valkey) or "+
+			"'watch' (uses Kubernetes informers, no audit webhook or Valkey needed, no author attribution).")
+	fs.StringVar(&cfg.watchModeCommitterName, "watch-mode-committer-name", "gitops-reverser-watch",
+		"Committer display name used for commits in watch mode. Ignored in audit mode.")
+	fs.StringVar(&cfg.watchModeCommitterEmail, "watch-mode-committer-email", "",
+		"Committer email used for commits in watch mode. Ignored in audit mode. "+
+			"Defaults to <committer-name>@gitops-reverser.local when empty.")
 	fs.StringVar(&cfg.metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	fs.StringVar(&cfg.probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -528,6 +552,12 @@ func bindServerCertFlags(
 }
 
 func validateAuditConfig(cfg appConfig) error {
+	if cfg.captureMode != captureModeAudit && cfg.captureMode != captureModeWatch {
+		return fmt.Errorf("capture-mode must be %q or %q, got %q", captureModeAudit, captureModeWatch, cfg.captureMode)
+	}
+	if cfg.captureMode == captureModeWatch {
+		return nil
+	}
 	if cfg.auditPort <= 0 {
 		return fmt.Errorf("audit-port must be > 0, got %d", cfg.auditPort)
 	}
@@ -568,6 +598,18 @@ func validateAuditConfig(cfg appConfig) error {
 		return fmt.Errorf("audit-event-body-wait must be >= 0, got %s", cfg.auditEventBodyWait)
 	}
 	return nil
+}
+
+// buildWatchModeCommitter constructs the git.UserInfo used as the commit author in watch mode.
+// Username is required for the author to be distinct from the operator committer; DisplayName
+// mirrors it so git shows the human-readable name. Email is optional — authorEmail() in the git
+// package falls back to ConstructSafeEmail(username, "cluster.local") when empty.
+func buildWatchModeCommitter(cfg appConfig) git.UserInfo {
+	return git.UserInfo{
+		Username:    cfg.watchModeCommitterName,
+		DisplayName: cfg.watchModeCommitterName,
+		Email:       cfg.watchModeCommitterEmail,
+	}
 }
 
 // fatalIfErr logs and exits the process if err is not nil.

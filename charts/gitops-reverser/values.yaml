@@ -55,6 +55,9 @@ securityContext:
 # 'watch': uses Kubernetes informers only; works on any cluster with no kube-apiserver flags or Valkey needed,
 #          but commits use the GitProvider committer identity — real end-user attribution is not available.
 captureMode: audit
+# Interval at which a forced full re-snapshot runs in watch mode to self-heal missed informer events.
+# Set to "0s" to disable. Ignored when captureMode is "audit".
+watchModeReconcileInterval: 10m
 
 # Controller manager configuration
 controllerManager:

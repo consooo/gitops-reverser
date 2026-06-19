@@ -637,3 +637,17 @@ func TestSnapshotWildcardResourceAbortsOnAnyListError(t *testing.T) {
 	require.Error(t, err,
 		"a wildcard snapshot still aborts on a failed GVR list rather than emitting a partial view")
 }
+
+func TestResetDeliveredRuleSetHashes_ClearsAllEntries(t *testing.T) {
+	m := &Manager{
+		lastDeliveredRuleSetHash: map[string]uint64{
+			"ns/target-a": 42,
+			"ns/target-b": 99,
+		},
+	}
+
+	m.resetDeliveredRuleSetHashes()
+
+	assert.Empty(t, m.lastDeliveredRuleSetHash,
+		"resetDeliveredRuleSetHashes must clear all per-target hash entries so the next ReconcileForRuleChange triggers a full re-snapshot")
+}

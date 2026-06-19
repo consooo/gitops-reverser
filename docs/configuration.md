@@ -48,7 +48,13 @@ events carry no actor identity. All commits use the bot identity configured by
 captureMode: watch                         # switch to watch mode
 watchModeCommitterName: gitops-reverser    # optional: custom bot name
 watchModeCommitterEmail: ""                # optional: defaults to <name>@gitops-reverser.local
+watchModeReconcileInterval: 10m            # optional: periodic full re-snapshot to self-heal missed events
 ```
+
+The `watchModeReconcileInterval` value (flag `--watch-mode-reconcile-interval`) controls how often the
+operator forces a full cluster re-snapshot in watch mode to recover from any events that the informers
+may have missed during restarts or cache re-lists. Set to `"0s"` to disable. Has no effect in `audit`
+mode.
 
 ## Additional sensitive resources
 

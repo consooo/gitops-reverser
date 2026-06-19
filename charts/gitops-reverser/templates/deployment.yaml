@@ -86,6 +86,7 @@ spec:
             - --audit-event-decision-ttl={{ .Values.auditEventJoin.decisionTTL }}
             - --audit-event-body-wait={{ .Values.auditEventJoin.bodyWait }}
             - --capture-mode={{ .Values.captureMode }}
+            - --watch-mode-reconcile-interval={{ .Values.watchModeReconcileInterval }}
             {{- if .Values.logging.level }}
             - --zap-log-level={{ .Values.logging.level }}
             {{- end }}

@@ -159,12 +159,13 @@ func main() {
 
 	// Watch ingestion manager (placeholder, will get EventRouter set later)
 	watchMgr := &watch.Manager{
-		Client:                 mgr.GetClient(),
-		Log:                    ctrl.Log.WithName("watch"),
-		RuleStore:              ruleStore,
-		EventRouter:            nil, // Will be set below
-		AuditLiveEventsEnabled: cfg.captureMode == captureModeAudit,
-		WatchModeCommitter:     buildWatchModeCommitter(cfg),
+		Client:                     mgr.GetClient(),
+		Log:                        ctrl.Log.WithName("watch"),
+		RuleStore:                  ruleStore,
+		EventRouter:                nil, // Will be set below
+		AuditLiveEventsEnabled:     cfg.captureMode == captureModeAudit,
+		WatchModeCommitter:         buildWatchModeCommitter(cfg),
+		WatchModeReconcileInterval: cfg.watchModeReconcileInterval,
 	}
 
 	// Initialize EventRouter with all dependencies
@@ -370,43 +371,44 @@ const (
 
 // appConfig holds parsed CLI flags and logging options.
 type appConfig struct {
-	captureMode              string
-	watchModeCommitterName   string
-	watchModeCommitterEmail  string
-	metricsAddr              string
-	metricsCertPath          string
-	metricsCertName          string
-	metricsCertKey           string
-	probeAddr                string
-	metricsInsecure          bool
-	enableHTTP2              bool
-	auditListenAddress       string
-	auditPort                int
-	auditCertPath            string
-	auditCertName            string
-	auditCertKey             string
-	auditClientCAPath        string
-	auditClientCAName        string
-	auditInsecure            bool
-	auditMaxRequestBodyBytes int64
-	auditReadTimeout         time.Duration
-	auditWriteTimeout        time.Duration
-	auditIdleTimeout         time.Duration
-	auditRedisAddr           string
-	auditRedisUsername       string
-	auditRedisPassword       string
-	auditRedisDB             int
-	auditRedisStream         string
-	auditRedisMaxLen         int64
-	auditDebugRedisStream    string
-	auditDebugRedisMaxLen    int64
-	auditRedisTLS            bool
-	auditEventBodyTTL        time.Duration
-	auditEventDecisionTTL    time.Duration
-	auditEventBodyWait       time.Duration
-	branchBufferMaxBytes     int64
-	sensitiveResources       types.SensitiveResourcePolicy
-	zapOpts                  zap.Options
+	captureMode                string
+	watchModeCommitterName     string
+	watchModeCommitterEmail    string
+	watchModeReconcileInterval time.Duration
+	metricsAddr                string
+	metricsCertPath            string
+	metricsCertName            string
+	metricsCertKey             string
+	probeAddr                  string
+	metricsInsecure            bool
+	enableHTTP2                bool
+	auditListenAddress         string
+	auditPort                  int
+	auditCertPath              string
+	auditCertName              string
+	auditCertKey               string
+	auditClientCAPath          string
+	auditClientCAName          string
+	auditInsecure              bool
+	auditMaxRequestBodyBytes   int64
+	auditReadTimeout           time.Duration
+	auditWriteTimeout          time.Duration
+	auditIdleTimeout           time.Duration
+	auditRedisAddr             string
+	auditRedisUsername         string
+	auditRedisPassword         string
+	auditRedisDB               int
+	auditRedisStream           string
+	auditRedisMaxLen           int64
+	auditDebugRedisStream      string
+	auditDebugRedisMaxLen      int64
+	auditRedisTLS              bool
+	auditEventBodyTTL          time.Duration
+	auditEventDecisionTTL      time.Duration
+	auditEventBodyWait         time.Duration
+	branchBufferMaxBytes       int64
+	sensitiveResources         types.SensitiveResourcePolicy
+	zapOpts                    zap.Options
 }
 
 // parseFlags parses CLI flags and returns the application configuration.
@@ -430,6 +432,9 @@ func parseFlagsWithArgs(fs *flag.FlagSet, args []string) (appConfig, error) {
 	fs.StringVar(&cfg.watchModeCommitterEmail, "watch-mode-committer-email", "",
 		"Committer email used for commits in watch mode. Ignored in audit mode. "+
 			"Defaults to <committer-name>@gitops-reverser.local when empty.")
+	fs.DurationVar(&cfg.watchModeReconcileInterval, "watch-mode-reconcile-interval", 10*time.Minute,
+		"Interval at which a forced full re-snapshot is triggered in watch mode to self-heal missed informer events. "+
+			"Set to 0 to disable. Ignored in audit mode.")
 	fs.StringVar(&cfg.metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	fs.StringVar(&cfg.probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")

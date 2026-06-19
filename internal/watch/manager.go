@@ -76,6 +76,10 @@ type Manager struct {
 	// informer events (capture-mode=watch). Falls back to an empty UserInfo (which uses
 	// the GitProvider committer config) when both fields are empty.
 	WatchModeCommitter git.UserInfo
+	// WatchModeReconcileInterval is the period at which a forced full re-snapshot is
+	// triggered in watch mode to self-heal any events missed by the informers (restart,
+	// cache re-list). Zero or negative disables the feature.
+	WatchModeReconcileInterval time.Duration
 	// Deduplication: tracks last seen content hash per resource to skip status-only changes
 	lastSeenMu   sync.RWMutex
 	lastSeenHash map[string]uint64 // resourceKey → content hash (key uses types.ResourceIdentifier.Key)
@@ -221,6 +225,17 @@ func (m *Manager) Start(ctx context.Context) error {
 	heartbeatTicker := time.NewTicker(heartbeatInterval)
 	defer heartbeatTicker.Stop()
 
+	// Watch-mode periodic forced re-snapshot: re-snapshots all targets on a fixed
+	// cadence to self-heal any events the informers may have missed. A nil channel
+	// blocks forever, so this is a no-op when the feature is disabled or in audit mode.
+	var watchPeriodicC <-chan time.Time
+	if !m.AuditLiveEventsEnabled && m.WatchModeReconcileInterval > 0 {
+		t := time.NewTicker(m.WatchModeReconcileInterval)
+		defer t.Stop()
+		watchPeriodicC = t.C
+		log.Info("Watch mode periodic reconciliation enabled", "interval", m.WatchModeReconcileInterval)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -231,6 +246,13 @@ func (m *Manager) Start(ctx context.Context) error {
 			log.V(1).Info("Periodic reconciliation triggered")
 			if err := m.ReconcileForRuleChange(ctx); err != nil {
 				log.Error(err, "Periodic reconciliation failed")
+			}
+
+		case <-watchPeriodicC:
+			log.Info("Watch mode periodic reconciliation triggered", "interval", m.WatchModeReconcileInterval)
+			m.resetDeliveredRuleSetHashes()
+			if err := m.ReconcileForRuleChange(ctx); err != nil {
+				log.Error(err, "Watch mode periodic reconciliation failed")
 			}
 
 		case <-m.catalogRefreshCh:
@@ -249,6 +271,15 @@ func (m *Manager) Start(ctx context.Context) error {
 			log.V(1).Info("Watch manager heartbeat", "activeInformers", totalInformers)
 		}
 	}
+}
+
+// resetDeliveredRuleSetHashes clears the per-target delivered hash records so that
+// the next call to snapshotTargetsNeedingDelivery treats every target as needing a
+// fresh snapshot. Used by the watch-mode periodic reconciliation to self-heal missed events.
+func (m *Manager) resetDeliveredRuleSetHashes() {
+	m.ruleSetSnapshotMu.Lock()
+	defer m.ruleSetSnapshotMu.Unlock()
+	m.lastDeliveredRuleSetHash = make(map[string]uint64)
 }
 
 func (m *Manager) initializeManagerState() {

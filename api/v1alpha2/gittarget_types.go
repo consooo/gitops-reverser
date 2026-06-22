@@ -123,6 +123,11 @@ type GitTargetStatus struct {
 	// resource types this GitTarget claims.
 	// +optional
 	Materialization *GitTargetMaterializationStatus `json:"materialization,omitempty"`
+
+	// CaptureMode reflects the operator-level event capture mode active for this GitTarget.
+	// Will be either "audit" or "watch".
+	// +optional
+	CaptureMode string `json:"captureMode,omitempty"`
 }
 
 // GitTargetMaterializationStatus is a bounded roll-up of the demand-driven materialization

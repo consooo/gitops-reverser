@@ -111,6 +111,9 @@ type GitTargetReconciler struct {
 	Scheme        *runtime.Scheme
 	WorkerManager *git.WorkerManager
 	EventRouter   *watch.EventRouter
+	// CaptureMode is the operator-level capture mode ("audit" or "watch") surfaced in
+	// status.captureMode so users can see which mode is active without inspecting flags.
+	CaptureMode string
 }
 
 // +kubebuilder:rbac:groups=configbutler.ai,resources=gittargets,verbs=get;list;watch;create;update;patch;delete
@@ -131,6 +134,9 @@ func (r *GitTargetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	target.Status.ObservedGeneration = target.Generation
 	target.Status.LastReconcileTime = metav1.Now()
+	if r.CaptureMode != "" {
+		target.Status.CaptureMode = r.CaptureMode
+	}
 
 	providerNS := target.Namespace
 	validated, validationMsg, validationResult, validationErr := r.evaluateValidatedGate(ctx, &target, providerNS)

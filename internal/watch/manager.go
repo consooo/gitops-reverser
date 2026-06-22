@@ -223,6 +223,19 @@ type Manager struct {
 	// docs/design/stream/signing-snapshot-tail-replay-failure-investigation.md §7.
 	targetTypeWatermarkMu sync.Mutex
 	targetTypeWatermark   map[string]map[schema.GroupVersionResource]string
+
+	// WatchModeCommitter is the git author/committer identity used for commits in watch mode,
+	// where there is no per-event user attribution from the audit log.
+	WatchModeCommitter git.UserInfo
+
+	// WatchModeReconcileInterval is how often a forced full re-snapshot runs in watch mode to
+	// self-heal any events missed during informer restarts or cache re-lists. Zero disables it.
+	WatchModeReconcileInterval time.Duration
+
+	// watchInformersMu guards watchInformers.
+	watchInformersMu sync.Mutex
+	// watchInformers holds a cancel func per active GVR informer in watch mode.
+	watchInformers map[schema.GroupVersionResource]context.CancelFunc
 }
 
 // AuditLogTrimmer bounds a type's main audit stream to the oldest currently-serving checkpoint
@@ -316,6 +329,12 @@ func (m *Manager) Start(ctx context.Context) error {
 	if err := m.ReconcileForRuleChange(ctx); err != nil {
 		log.Error(err, "Initial reconciliation failed, will retry periodically")
 	}
+
+	// Watch mode: start per-GVR informers and the periodic reconcile after the initial snapshot
+	// has seeded git, so informer events land on top of an already-consistent baseline.
+	m.startWatchModeInformers(ctx, log.WithName("watch-informers"))
+	m.startWatchModePeriodicReconcile(ctx, log.WithName("watch-reconcile"))
+
 	m.startAPISurfaceTriggerInformers(ctx, log.WithName("catalog-triggers"))
 
 	// Periodic reconciliation for CRD detection and missed changes
@@ -329,6 +348,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			m.stopAllWatchModeInformers()
 			return nil
 
 		case <-periodicTicker.C:

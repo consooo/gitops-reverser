@@ -117,6 +117,9 @@ func (g *redisReadinessGate) Err() error {
 
 // auditServingReadyCheck fails until the audit ingress listener is bound and accepting.
 func auditServingReadyCheck(probe auditReadinessProbe) healthz.Checker {
+	if probe == nil {
+		return nil
+	}
 	return func(_ *http.Request) error {
 		if !probe.Serving() {
 			return errors.New("audit ingress not yet serving")

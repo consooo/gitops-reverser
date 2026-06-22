@@ -129,8 +129,10 @@ func (m *Manager) handleTypeLifecycleEvent(ctx context.Context, log logr.Logger,
 	case typeset.TypeActivated:
 		// A followability (re)activation backfill, not a periodic heal: establish the reconcile
 		// promptly (heal=false).
+		m.startWatchModeInformerForType(ctx, log, ev.GVR)
 		m.reconcileTypeForSyncedTargets(ctx, log, ev.GVR, false)
 	case typeset.TypeRemoved:
+		m.stopWatchModeInformerForType(ev.GVR)
 		m.sweepTypeFromSyncedTargets(ctx, log, ev.GVR)
 	case typeset.TypeWobbling, typeset.TypeRecovered, typeset.TypeRefused:
 		log.Info("type-lifecycle transition handled (no git action)",

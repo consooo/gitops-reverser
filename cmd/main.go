@@ -80,6 +80,9 @@ const (
 	// checkpointRestoreTimeout bounds the one-shot boot replay of durable per-type
 	// checkpoints into the materializer (DEC-L6); a cold/unreachable Redis must not stall startup.
 	checkpointRestoreTimeout = 30 * time.Second
+	// defaultWatchModeReconcileInterval is how often a forced full re-snapshot runs in watch mode
+	// when --watch-mode-reconcile-interval is not explicitly set.
+	defaultWatchModeReconcileInterval = 10 * time.Minute
 	// auditTailReaderPoolSize is the connection-pool size for the dedicated audit-tail-reader client.
 	// Each followed type runs one tail parked in a blocking XREAD (one held connection), and a
 	// wildcard GitTarget can follow every namespaced type at once, so the reader needs far more than
@@ -107,7 +110,12 @@ func main() {
 		"buildDate", bi.BuildDate,
 		"goVersion", bi.GoVersion)
 
-	if cfg.auditRedisPassword == "" {
+	isWatchMode := cfg.captureMode == "watch"
+	if isWatchMode {
+		setupLog.Info("Watch mode enabled: no Redis/Valkey or audit webhook required",
+			"committer", cfg.watchModeCommitterName,
+			"reconcileInterval", cfg.watchModeReconcileInterval)
+	} else if cfg.auditRedisPassword == "" {
 		setupLog.Info(
 			"no Redis password configured — "+
 				"connecting to Valkey without authentication is not recommended for production deployments",
@@ -180,6 +188,15 @@ func main() {
 	// Set EventRouter reference in WatchManager
 	watchMgr.EventRouter = eventRouter
 
+	// Wire watch-mode committer and reconcile interval. Only active when WatchModeEnabled()
+	// returns true (TypeSplicer == nil); harmless no-ops in audit mode.
+	watchMgr.WatchModeCommitter = git.UserInfo{
+		Username:    cfg.watchModeCommitterName,
+		DisplayName: cfg.watchModeCommitterName,
+		Email:       cfg.watchModeCommitterEmail,
+	}
+	watchMgr.WatchModeReconcileInterval = cfg.watchModeReconcileInterval
+
 	// Inject the live followability registry into the writer, so a GVR-only DELETE
 	// event resolves to a manifest moved off its canonical path (M6 in the writer).
 	// The registry is a stable pointer the watch manager refreshes in place.
@@ -201,187 +218,12 @@ func main() {
 		WatchManager: watchMgr,
 	}).SetupWithManager(mgr), "unable to create controller", "controller", "ClusterWatchRule")
 
-	var auditDebugQueue webhookhandler.AuditDebugEventQueue
-	if cfg.auditDebugRedisStream != "" {
-		auditDebugQueue, err = queue.NewRedisAuditDebugQueue(queue.RedisAuditQueueConfig{
-			Addr:       cfg.auditRedisAddr,
-			Username:   cfg.auditRedisUsername,
-			AuthValue:  cfg.auditRedisPassword,
-			DB:         cfg.auditRedisDB,
-			Stream:     cfg.auditDebugRedisStream,
-			MaxLen:     cfg.auditDebugRedisMaxLen,
-			TLSEnabled: cfg.auditRedisTLS,
-		})
-		fatalIfErr(err, "unable to initialize audit debug redis queue")
+	// auditModeResult carries the components that setupAuditMode creates. All fields are nil
+	// in watch mode (setupAuditMode is not called).
+	var auditResult auditModeResult
+	if !isWatchMode {
+		auditResult = setupAuditMode(setupCtx, cfg, watchMgr, mgr, tlsOpts)
 	}
-
-	// Per-resource-type stream mirror: always active. It mirrors each canonical event
-	// into one stream per resource type for the offline analysis experiment and shares
-	// the producer's Redis connection and MaxLen bound. See
-	// docs/design/stream/per-resource-type-rv-keyed-streams-experiment.md.
-	auditByTypeQueue, err := queue.NewRedisByTypeStreamQueue(queue.RedisByTypeStreamConfig{
-		Addr:          cfg.auditRedisAddr,
-		Username:      cfg.auditRedisUsername,
-		AuthValue:     cfg.auditRedisPassword,
-		DB:            cfg.auditRedisDB,
-		Prefix:        cfg.auditByTypeStreamPrefix,
-		MaxLen:        cfg.auditRedisMaxLen,
-		TLSEnabled:    cfg.auditRedisTLS,
-		DiagStreams:   cfg.auditByTypeDiag,
-		DiagMaxLen:    cfg.auditByTypeDiagMaxLen,
-		DiagResources: splitCSV(cfg.auditByTypeDiagResources),
-	})
-	fatalIfErr(err, "unable to initialize per-resource-type audit redis queue")
-
-	// Divert nudge: an ordered event whose RV arrived below the stream high-water (e.g. concurrent
-	// audit batches interleaving) is diverted — rejected from the main stream and never replayed by
-	// the per-type tail — so let the materialization layer pull the type's next checkpoint forward
-	// instead of serving a silently stale mirror until the ~1h sweep.
-	auditByTypeQueue.SetLateEventNotifier(watchMgr.NudgeTypeResyncForLateEvent)
-
-	// Per-resource-type current-objects snapshot: loaded once when a type activates (not per
-	// GitTarget), beside the audit stream under the same base key. Shares the producer's Redis
-	// connection and key prefix. See
-	// docs/design/stream/per-resource-type-rv-keyed-streams-experiment.md.
-	auditObjectsSnapshot, err := queue.NewRedisObjectsSnapshot(queue.RedisObjectsSnapshotConfig{
-		Addr:       cfg.auditRedisAddr,
-		Username:   cfg.auditRedisUsername,
-		AuthValue:  cfg.auditRedisPassword,
-		DB:         cfg.auditRedisDB,
-		Prefix:     cfg.auditByTypeStreamPrefix,
-		TLSEnabled: cfg.auditRedisTLS,
-	})
-	fatalIfErr(err, "unable to initialize per-resource-type objects snapshot")
-	watchMgr.ObjectMirror = auditObjectsSnapshot
-
-	// The same per-type queue trims its audit log to the checkpoint cursor on each re-anchor
-	// (R1, §6 trim-cursor model), so a splice reconcile never scans more than one interval of
-	// history. Sharing the queue keeps one Redis connection and the same key prefix.
-	watchMgr.AuditLogTrimmer = auditByTypeQueue
-
-	// Demand gate: the shared required-types set + ping stream that bounds the per-type mirror to
-	// claimed ∩ followable types — so we stop creating a stream for every cluster type ("the Redis
-	// explosion"). The watch driver Requires a type at SyncRequested (early, before the LIST) and
-	// Unrequires + DeleteTypes it on Released; the audit webhook reads the gate before mirroring.
-	// Multi-pod-ready: the signal is shared, the read side is an in-memory cache fanned out by the
-	// ping stream. See docs/finished/demand-gated-audit-ingestion.md.
-	mirrorGate, err := gate.New(gate.Config{
-		Addr:       cfg.auditRedisAddr,
-		Username:   cfg.auditRedisUsername,
-		AuthValue:  cfg.auditRedisPassword,
-		DB:         cfg.auditRedisDB,
-		Prefix:     cfg.auditByTypeStreamPrefix,
-		TLSEnabled: cfg.auditRedisTLS,
-	})
-	fatalIfErr(err, "unable to initialize demand gate")
-	watchMgr.MirrorGate = mirrorGate
-	watchMgr.AuditKeyDeleter = auditByTypeQueue
-
-	// The splice reader (R2) folds each type's checkpoint + log into the desired set the per-type
-	// reconcile commits, off the same per-type keyspace. Wiring it makes GitTarget reconcile a
-	// CONSUMER of the materialized API — zero per-reconcile API calls. See
-	// docs/design/stream/api-source-of-truth-reconcile.md §6.
-	auditTypeSplicer, err := queue.NewRedisTypeSplicer(queue.RedisObjectsSnapshotConfig{
-		Addr:       cfg.auditRedisAddr,
-		Username:   cfg.auditRedisUsername,
-		AuthValue:  cfg.auditRedisPassword,
-		DB:         cfg.auditRedisDB,
-		Prefix:     cfg.auditByTypeStreamPrefix,
-		TLSEnabled: cfg.auditRedisTLS,
-	})
-	fatalIfErr(err, "unable to initialize per-resource-type splice reader")
-	watchMgr.TypeSplicer = auditTypeSplicer
-
-	// The audit-arrival wake (R2): a per-type tail re-applies events the instant they land, for
-	// sub-checkpoint-interval freshness. Each followed type holds ONE connection parked in a blocking
-	// XREAD, so the reader gets its OWN client with a large pool — isolated from the mirror's writes
-	// (auditByTypeQueue above) so dozens of blocking reads (a wildcard GitTarget follows many types)
-	// can never starve the webhook's per-type mirror append. One multiplexed XREAD across all streams
-	// is the eventual scale answer (audit_tail.go, R10/HA); until then this sizing covers it. See
-	// api-source-of-truth-reconcile.md §8 (R2).
-	auditTailReaderQueue, err := queue.NewRedisByTypeStreamQueue(queue.RedisByTypeStreamConfig{
-		Addr:       cfg.auditRedisAddr,
-		Username:   cfg.auditRedisUsername,
-		AuthValue:  cfg.auditRedisPassword,
-		DB:         cfg.auditRedisDB,
-		Prefix:     cfg.auditByTypeStreamPrefix,
-		MaxLen:     cfg.auditRedisMaxLen,
-		TLSEnabled: cfg.auditRedisTLS,
-		PoolSize:   auditTailReaderPoolSize,
-	})
-	fatalIfErr(err, "unable to initialize per-resource-type audit tail reader")
-	watchMgr.AuditTailReader = auditTailReaderQueue
-
-	// Boot rebuild (DEC-L6): replay durable per-type checkpoints into the materializer so a
-	// restart resumes serving Synced types without re-listing them. Best-effort and decoupled —
-	// the queue owns the Redis read, the watch manager assembles the GVR and marks the phase, and
-	// this composition root joins them. A cold/empty Redis just yields nothing; types re-fill on
-	// demand. Runs before the manager starts, so it precedes the first followability Update.
-	restoreCtx, cancelRestore := context.WithTimeout(setupCtx, checkpointRestoreTimeout)
-	if checkpoints, loadErr := auditObjectsSnapshot.LoadSyncedCheckpoints(restoreCtx); loadErr != nil {
-		setupLog.Error(loadErr, "unable to load durable materialization checkpoints; starting cold")
-	} else {
-		for _, cp := range checkpoints {
-			watchMgr.RestoreSyncedCheckpoint(cp.Group, cp.Version, cp.Resource, cp.ResourceVersion)
-		}
-		setupLog.Info("restored materialization checkpoints from durable state", "count", len(checkpoints))
-	}
-	cancelRestore()
-
-	auditJoiner, err := webhookhandler.NewRedisAuditEventJoiner(webhookhandler.RedisAuditJoinerConfig{
-		Addr:             cfg.auditRedisAddr,
-		Username:         cfg.auditRedisUsername,
-		AuthValue:        cfg.auditRedisPassword,
-		DB:               cfg.auditRedisDB,
-		TLSEnabled:       cfg.auditRedisTLS,
-		BodyTTL:          cfg.auditEventBodyTTL,
-		OfficialBodyWait: cfg.auditEventBodyWait,
-	})
-	fatalIfErr(err, "unable to initialize audit event joiner")
-	setupLog.Info("Audit pipeline configured",
-		"redisAddress", cfg.auditRedisAddr,
-		"debugStream", cfg.auditDebugRedisStream,
-		"db", cfg.auditRedisDB,
-		"tlsEnabled", cfg.auditRedisTLS,
-		"bodyTTL", cfg.auditEventBodyTTL,
-		"officialBodyWait", cfg.auditEventBodyWait,
-		"redisMaxLen", cfg.auditRedisMaxLen,
-		"debugRedisMaxLen", cfg.auditDebugRedisMaxLen,
-		"byTypeStreamPrefix", cfg.auditByTypeStreamPrefix)
-
-	if cfg.auditRedisMaxLen == 0 {
-		setupLog.Info(
-			"audit redis stream max length is 0; per-type stream retention is unbounded — " +
-				"Valkey/Redis memory and restart/reload time can grow without limit. " +
-				"Set --audit-redis-max-len (queue.redis.maxLen in the Helm chart) to a bounded value.",
-		)
-	}
-	if cfg.auditDebugRedisStream != "" && cfg.auditDebugRedisMaxLen == 0 {
-		setupLog.Info(
-			"audit debug redis stream max length is 0; debug queue retention is unbounded — "+
-				"the debug stream stores every decoded audit event before filtering/joining, "+
-				"so unbounded mode is especially risky. "+
-				"Set --audit-debug-redis-max-len (webhook.audit.debugStream.maxLen in the Helm chart) to a bounded value.",
-			"debugStream", cfg.auditDebugRedisStream,
-		)
-	}
-
-	auditHandler, err := webhookhandler.NewAuditHandler(webhookhandler.AuditHandlerConfig{
-		MaxRequestBodyBytes:  cfg.auditMaxRequestBodyBytes,
-		DebugQueue:           auditDebugQueue,
-		Joiner:               auditJoiner,
-		ByTypeQueue:          auditByTypeQueue,
-		MirrorGate:           mirrorGate,
-		CommitRequestAuthors: auditByTypeQueue,
-	})
-	fatalIfErr(err, "unable to create audit handler")
-
-	var auditCertWatcher *certwatcher.CertWatcher
-
-	auditRunnable, watcher, initErr := initAuditServerRunnable(cfg, tlsOpts, auditHandler)
-	fatalIfErr(initErr, "unable to initialize audit ingress server")
-	auditCertWatcher = watcher
-	fatalIfErr(mgr.Add(auditRunnable), "unable to add audit ingress server runnable")
 
 	// Setup watch manager (must be after controllers are set up)
 	fatalIfErr(watchMgr.SetupWithManager(mgr), "unable to setup watch ingestion manager")
@@ -400,6 +242,7 @@ func main() {
 		Scheme:        mgr.GetScheme(),
 		WorkerManager: workerManager,
 		EventRouter:   eventRouter,
+		CaptureMode:   cfg.captureMode,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "GitTarget")
 		os.Exit(1)
@@ -409,7 +252,7 @@ func main() {
 		Scheme:       mgr.GetScheme(),
 		APIReader:    mgr.GetAPIReader(),
 		Finalizer:    eventRouter,
-		AuthorLookup: auditByTypeQueue,
+		AuthorLookup: auditResult.auditByTypeQueue, // nil in watch mode: commit request finalization is disabled
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "CommitRequest")
 		os.Exit(1)
@@ -417,20 +260,23 @@ func main() {
 	// +kubebuilder:scaffold:builder
 
 	// Cert watchers
-	addCertWatchersToManager(mgr, metricsCertWatcher, auditCertWatcher)
+	addCertWatchersToManager(mgr, metricsCertWatcher, auditResult.auditCertWatcher)
 
-	// Demand gate runnable: seeds the required-types set, then runs the ping-stream subscriber so
-	// every pod converges on the shared demand signal. Added to the manager so it shares the run
-	// context and shuts down cleanly.
-	fatalIfErr(mgr.Add(mirrorGate), "unable to add demand gate runnable")
+	var redisGate *redisReadinessGate
+	if auditResult.mirrorGate != nil {
+		// Demand gate runnable: seeds the required-types set, then runs the ping-stream subscriber so
+		// every pod converges on the shared demand signal. Added to the manager so it shares the run
+		// context and shuts down cleanly.
+		fatalIfErr(mgr.Add(auditResult.mirrorGate), "unable to add demand gate runnable")
 
-	// Startup-only Redis readiness gate: a Runnable that PINGs the audit producer until the first
-	// success, keeping the pod not-ready (out of the audit Service endpoints) until it can enqueue.
-	redisGate := newRedisReadinessGate(auditByTypeQueue)
-	fatalIfErr(mgr.Add(redisGate), "unable to add audit redis readiness gate")
+		// Startup-only Redis readiness gate: a Runnable that PINGs the audit producer until the first
+		// success, keeping the pod not-ready (out of the audit Service endpoints) until it can enqueue.
+		redisGate = newRedisReadinessGate(auditResult.auditByTypeQueue)
+		fatalIfErr(mgr.Add(redisGate), "unable to add audit redis readiness gate")
+	}
 
 	// Health checks: liveness stays a bare Ping; readiness reflects audit-serving preconditions.
-	addHealthChecks(mgr, auditRunnable, auditCertWatcher, redisGate)
+	addHealthChecks(mgr, auditResult.auditProbe, auditResult.auditCertWatcher, redisGate)
 
 	// Start manager
 	setupLog.Info("starting manager")
@@ -476,6 +322,12 @@ type appConfig struct {
 	sensitiveResources       types.SensitiveResourcePolicy
 	sshHostKeys              git.SSHHostKeyConfig
 	zapOpts                  zap.Options
+
+	// Watch mode flags
+	captureMode                string
+	watchModeCommitterName     string
+	watchModeCommitterEmail    string
+	watchModeReconcileInterval time.Duration
 }
 
 // parseFlags parses CLI flags and returns the application configuration.
@@ -581,6 +433,15 @@ func parseFlagsWithArgs(fs *flag.FlagSet, args []string) (appConfig, error) {
 	fs.BoolVar(&cfg.sshHostKeys.AllowMissingKnownHosts, "insecure-allow-missing-known-hosts", false,
 		"INSECURE, dev/throwaway clusters only: permit SSH when no host-key source produced any "+
 			"known_hosts at all. A present-but-unparseable known_hosts is always a hard error.")
+	fs.StringVar(&cfg.captureMode, "capture-mode", "audit",
+		"Event capture mode: 'audit' (default, requires kube-apiserver audit webhook + Valkey/Redis) "+
+			"or 'watch' (uses native Kubernetes informers, no Redis or audit webhook required).")
+	fs.StringVar(&cfg.watchModeCommitterName, "watch-mode-committer-name", "gitops-reverser",
+		"Git committer name for watch-mode commits (used when --capture-mode=watch).")
+	fs.StringVar(&cfg.watchModeCommitterEmail, "watch-mode-committer-email", "gitops-reverser@local",
+		"Git committer email for watch-mode commits (used when --capture-mode=watch).")
+	fs.DurationVar(&cfg.watchModeReconcileInterval, "watch-mode-reconcile-interval", defaultWatchModeReconcileInterval,
+		"How often to force a full re-snapshot in watch mode to recover missed events (0 disables).")
 	cfg.zapOpts = zap.Options{
 		// Production mode defaults to JSON encoding, which is easier for log processors to parse.
 		Development: false,
@@ -631,6 +492,12 @@ func bindServerCertFlags(
 }
 
 func validateAuditConfig(cfg appConfig) error {
+	if cfg.captureMode != "audit" && cfg.captureMode != "watch" {
+		return fmt.Errorf("--capture-mode must be 'audit' or 'watch', got %q", cfg.captureMode)
+	}
+	if cfg.captureMode == "watch" {
+		return nil
+	}
 	if cfg.auditPort <= 0 {
 		return fmt.Errorf("audit-port must be > 0, got %d", cfg.auditPort)
 	}
@@ -982,5 +849,212 @@ func addCertWatchersToManager(
 		}
 		setupLog.Info("Adding certificate watcher to manager", "component", item.component)
 		fatalIfErr(mgr.Add(item.watcher), "unable to add certificate watcher to manager", "component", item.component)
+	}
+}
+
+// auditModeResult holds the components created by setupAuditMode that main() uses after setup.
+// All fields are nil when running in watch mode (setupAuditMode is not called).
+type auditModeResult struct {
+	auditByTypeQueue *queue.RedisByTypeStreamQueue
+	mirrorGate       *gate.Gate
+	auditCertWatcher *certwatcher.CertWatcher
+	auditProbe       auditReadinessProbe
+}
+
+// setupAuditMode initialises every Redis/audit pipeline component for audit mode, wires them into
+// watchMgr, and adds the audit ingress server to mgr. It is factored out of main() so the
+// conditional "if !isWatchMode" block stays flat and passes the nestif linter.
+func setupAuditMode(
+	setupCtx context.Context,
+	cfg appConfig,
+	watchMgr *watch.Manager,
+	mgr ctrl.Manager,
+	tlsOpts []func(*tls.Config),
+) auditModeResult {
+	var auditDebugQueue webhookhandler.AuditDebugEventQueue
+	if cfg.auditDebugRedisStream != "" {
+		var err error
+		auditDebugQueue, err = queue.NewRedisAuditDebugQueue(queue.RedisAuditQueueConfig{
+			Addr:       cfg.auditRedisAddr,
+			Username:   cfg.auditRedisUsername,
+			AuthValue:  cfg.auditRedisPassword,
+			DB:         cfg.auditRedisDB,
+			Stream:     cfg.auditDebugRedisStream,
+			MaxLen:     cfg.auditDebugRedisMaxLen,
+			TLSEnabled: cfg.auditRedisTLS,
+		})
+		fatalIfErr(err, "unable to initialize audit debug redis queue")
+	}
+
+	// Per-resource-type stream mirror: always active. It mirrors each canonical event
+	// into one stream per resource type for the offline analysis experiment and shares
+	// the producer's Redis connection and MaxLen bound. See
+	// docs/design/stream/per-resource-type-rv-keyed-streams-experiment.md.
+	auditByTypeQueue, err := queue.NewRedisByTypeStreamQueue(queue.RedisByTypeStreamConfig{
+		Addr:          cfg.auditRedisAddr,
+		Username:      cfg.auditRedisUsername,
+		AuthValue:     cfg.auditRedisPassword,
+		DB:            cfg.auditRedisDB,
+		Prefix:        cfg.auditByTypeStreamPrefix,
+		MaxLen:        cfg.auditRedisMaxLen,
+		TLSEnabled:    cfg.auditRedisTLS,
+		DiagStreams:   cfg.auditByTypeDiag,
+		DiagMaxLen:    cfg.auditByTypeDiagMaxLen,
+		DiagResources: splitCSV(cfg.auditByTypeDiagResources),
+	})
+	fatalIfErr(err, "unable to initialize per-resource-type audit redis queue")
+
+	// Divert nudge: an ordered event whose RV arrived below the stream high-water (e.g. concurrent
+	// audit batches interleaving) is diverted — rejected from the main stream and never replayed by
+	// the per-type tail — so let the materialization layer pull the type's next checkpoint forward
+	// instead of serving a silently stale mirror until the ~1h sweep.
+	auditByTypeQueue.SetLateEventNotifier(watchMgr.NudgeTypeResyncForLateEvent)
+
+	// Per-resource-type current-objects snapshot: loaded once when a type activates (not per
+	// GitTarget), beside the audit stream under the same base key. Shares the producer's Redis
+	// connection and key prefix. See
+	// docs/design/stream/per-resource-type-rv-keyed-streams-experiment.md.
+	auditObjectsSnapshot, err := queue.NewRedisObjectsSnapshot(queue.RedisObjectsSnapshotConfig{
+		Addr:       cfg.auditRedisAddr,
+		Username:   cfg.auditRedisUsername,
+		AuthValue:  cfg.auditRedisPassword,
+		DB:         cfg.auditRedisDB,
+		Prefix:     cfg.auditByTypeStreamPrefix,
+		TLSEnabled: cfg.auditRedisTLS,
+	})
+	fatalIfErr(err, "unable to initialize per-resource-type objects snapshot")
+	watchMgr.ObjectMirror = auditObjectsSnapshot
+
+	// The same per-type queue trims its audit log to the checkpoint cursor on each re-anchor
+	// (R1, §6 trim-cursor model), so a splice reconcile never scans more than one interval of
+	// history. Sharing the queue keeps one Redis connection and the same key prefix.
+	watchMgr.AuditLogTrimmer = auditByTypeQueue
+
+	// Demand gate: the shared required-types set + ping stream that bounds the per-type mirror to
+	// claimed ∩ followable types — so we stop creating a stream for every cluster type ("the Redis
+	// explosion"). The watch driver Requires a type at SyncRequested (early, before the LIST) and
+	// Unrequires + DeleteTypes it on Released; the audit webhook reads the gate before mirroring.
+	// Multi-pod-ready: the signal is shared, the read side is an in-memory cache fanned out by the
+	// ping stream. See docs/finished/demand-gated-audit-ingestion.md.
+	mirrorGate, err := gate.New(gate.Config{
+		Addr:       cfg.auditRedisAddr,
+		Username:   cfg.auditRedisUsername,
+		AuthValue:  cfg.auditRedisPassword,
+		DB:         cfg.auditRedisDB,
+		Prefix:     cfg.auditByTypeStreamPrefix,
+		TLSEnabled: cfg.auditRedisTLS,
+	})
+	fatalIfErr(err, "unable to initialize demand gate")
+	watchMgr.MirrorGate = mirrorGate
+	watchMgr.AuditKeyDeleter = auditByTypeQueue
+
+	// The splice reader (R2) folds each type's checkpoint + log into the desired set the per-type
+	// reconcile commits, off the same per-type keyspace. Wiring it makes GitTarget reconcile a
+	// CONSUMER of the materialized API — zero per-reconcile API calls. See
+	// docs/design/stream/api-source-of-truth-reconcile.md §6.
+	auditTypeSplicer, err := queue.NewRedisTypeSplicer(queue.RedisObjectsSnapshotConfig{
+		Addr:       cfg.auditRedisAddr,
+		Username:   cfg.auditRedisUsername,
+		AuthValue:  cfg.auditRedisPassword,
+		DB:         cfg.auditRedisDB,
+		Prefix:     cfg.auditByTypeStreamPrefix,
+		TLSEnabled: cfg.auditRedisTLS,
+	})
+	fatalIfErr(err, "unable to initialize per-resource-type splice reader")
+	watchMgr.TypeSplicer = auditTypeSplicer
+
+	// The audit-arrival wake (R2): a per-type tail re-applies events the instant they land, for
+	// sub-checkpoint-interval freshness. Each followed type holds ONE connection parked in a blocking
+	// XREAD, so the reader gets its OWN client with a large pool — isolated from the mirror's writes
+	// (auditByTypeQueue above) so dozens of blocking reads (a wildcard GitTarget follows many types)
+	// can never starve the webhook's per-type mirror append. One multiplexed XREAD across all streams
+	// is the eventual scale answer (audit_tail.go, R10/HA); until then this sizing covers it. See
+	// api-source-of-truth-reconcile.md §8 (R2).
+	auditTailReaderQueue, err := queue.NewRedisByTypeStreamQueue(queue.RedisByTypeStreamConfig{
+		Addr:       cfg.auditRedisAddr,
+		Username:   cfg.auditRedisUsername,
+		AuthValue:  cfg.auditRedisPassword,
+		DB:         cfg.auditRedisDB,
+		Prefix:     cfg.auditByTypeStreamPrefix,
+		MaxLen:     cfg.auditRedisMaxLen,
+		TLSEnabled: cfg.auditRedisTLS,
+		PoolSize:   auditTailReaderPoolSize,
+	})
+	fatalIfErr(err, "unable to initialize per-resource-type audit tail reader")
+	watchMgr.AuditTailReader = auditTailReaderQueue
+
+	// Boot rebuild (DEC-L6): replay durable per-type checkpoints into the materializer so a
+	// restart resumes serving Synced types without re-listing them. Best-effort and decoupled —
+	// the queue owns the Redis read, the watch manager assembles the GVR and marks the phase, and
+	// this composition root joins them. A cold/empty Redis just yields nothing; types re-fill on
+	// demand. Runs before the manager starts, so it precedes the first followability Update.
+	restoreCtx, cancelRestore := context.WithTimeout(setupCtx, checkpointRestoreTimeout)
+	if checkpoints, loadErr := auditObjectsSnapshot.LoadSyncedCheckpoints(restoreCtx); loadErr != nil {
+		setupLog.Error(loadErr, "unable to load durable materialization checkpoints; starting cold")
+	} else {
+		for _, cp := range checkpoints {
+			watchMgr.RestoreSyncedCheckpoint(cp.Group, cp.Version, cp.Resource, cp.ResourceVersion)
+		}
+		setupLog.Info("restored materialization checkpoints from durable state", "count", len(checkpoints))
+	}
+	cancelRestore()
+
+	auditJoiner, err := webhookhandler.NewRedisAuditEventJoiner(webhookhandler.RedisAuditJoinerConfig{
+		Addr:             cfg.auditRedisAddr,
+		Username:         cfg.auditRedisUsername,
+		AuthValue:        cfg.auditRedisPassword,
+		DB:               cfg.auditRedisDB,
+		TLSEnabled:       cfg.auditRedisTLS,
+		BodyTTL:          cfg.auditEventBodyTTL,
+		OfficialBodyWait: cfg.auditEventBodyWait,
+	})
+	fatalIfErr(err, "unable to initialize audit event joiner")
+	setupLog.Info("Audit pipeline configured",
+		"redisAddress", cfg.auditRedisAddr,
+		"debugStream", cfg.auditDebugRedisStream,
+		"db", cfg.auditRedisDB,
+		"tlsEnabled", cfg.auditRedisTLS,
+		"bodyTTL", cfg.auditEventBodyTTL,
+		"officialBodyWait", cfg.auditEventBodyWait,
+		"redisMaxLen", cfg.auditRedisMaxLen,
+		"debugRedisMaxLen", cfg.auditDebugRedisMaxLen,
+		"byTypeStreamPrefix", cfg.auditByTypeStreamPrefix)
+
+	if cfg.auditRedisMaxLen == 0 {
+		setupLog.Info(
+			"audit redis stream max length is 0; per-type stream retention is unbounded — " +
+				"Valkey/Redis memory and restart/reload time can grow without limit. " +
+				"Set --audit-redis-max-len (queue.redis.maxLen in the Helm chart) to a bounded value.",
+		)
+	}
+	if cfg.auditDebugRedisStream != "" && cfg.auditDebugRedisMaxLen == 0 {
+		setupLog.Info(
+			"audit debug redis stream max length is 0; debug queue retention is unbounded — "+
+				"the debug stream stores every decoded audit event before filtering/joining, "+
+				"so unbounded mode is especially risky. "+
+				"Set --audit-debug-redis-max-len (webhook.audit.debugStream.maxLen in the Helm chart) to a bounded value.",
+			"debugStream", cfg.auditDebugRedisStream,
+		)
+	}
+
+	auditHandler, err := webhookhandler.NewAuditHandler(webhookhandler.AuditHandlerConfig{
+		MaxRequestBodyBytes:  cfg.auditMaxRequestBodyBytes,
+		DebugQueue:           auditDebugQueue,
+		Joiner:               auditJoiner,
+		ByTypeQueue:          auditByTypeQueue,
+		MirrorGate:           mirrorGate,
+		CommitRequestAuthors: auditByTypeQueue,
+	})
+	fatalIfErr(err, "unable to create audit handler")
+
+	auditRunnable, watcher, initErr := initAuditServerRunnable(cfg, tlsOpts, auditHandler)
+	fatalIfErr(initErr, "unable to initialize audit ingress server")
+	fatalIfErr(mgr.Add(auditRunnable), "unable to add audit ingress server runnable")
+
+	return auditModeResult{
+		auditByTypeQueue: auditByTypeQueue,
+		mirrorGate:       mirrorGate,
+		auditCertWatcher: watcher,
+		auditProbe:       auditRunnable,
 	}
 }

@@ -166,7 +166,6 @@ func (m *Manager) handleWatchModeEvent(
 		Object:     sanitized,
 		Identifier: id,
 		Operation:  operation,
-		UserInfo:   m.WatchModeCommitter,
 	}
 	m.routeWatchModeEvent(ctx, log, gvr, ev)
 }
@@ -186,7 +185,6 @@ func (m *Manager) handleWatchModeDeleteEvent(
 	ev := git.Event{
 		Identifier: id,
 		Operation:  "DELETE",
-		UserInfo:   m.WatchModeCommitter,
 	}
 	m.routeWatchModeEvent(ctx, log, gvr, ev)
 }

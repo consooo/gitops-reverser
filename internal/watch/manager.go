@@ -229,10 +229,6 @@ type Manager struct {
 	targetTypeWatermarkMu sync.Mutex
 	targetTypeWatermark   map[string]map[schema.GroupVersionResource]string
 
-	// WatchModeCommitter is the git author/committer identity used for commits in watch mode,
-	// where there is no per-event user attribution from the audit log.
-	WatchModeCommitter git.UserInfo
-
 	// WatchModeReconcileInterval is how often a forced full re-snapshot runs in watch mode to
 	// self-heal any events missed during informer restarts or cache re-lists. Zero disables it.
 	WatchModeReconcileInterval time.Duration

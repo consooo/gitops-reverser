@@ -113,8 +113,8 @@ func main() {
 	isWatchMode := cfg.captureMode == "watch"
 	if isWatchMode {
 		setupLog.Info("Watch mode enabled: no Redis/Valkey or audit webhook required",
-			"committer", cfg.watchModeCommitterName,
 			"reconcileInterval", cfg.watchModeReconcileInterval)
+		setupLog.Info("CommitRequest author lookup unavailable in watch mode; CommitRequest finalization is disabled")
 	} else if cfg.auditRedisPassword == "" {
 		setupLog.Info(
 			"no Redis password configured — "+
@@ -189,11 +189,6 @@ func main() {
 	watchMgr.EventRouter = eventRouter
 
 	watchMgr.WatchMode = isWatchMode
-	watchMgr.WatchModeCommitter = git.UserInfo{
-		Username:    cfg.watchModeCommitterName,
-		DisplayName: cfg.watchModeCommitterName,
-		Email:       cfg.watchModeCommitterEmail,
-	}
 	watchMgr.WatchModeReconcileInterval = cfg.watchModeReconcileInterval
 
 	// Inject the live followability registry into the writer, so a GVR-only DELETE
@@ -324,8 +319,6 @@ type appConfig struct {
 
 	// Watch mode flags
 	captureMode                string
-	watchModeCommitterName     string
-	watchModeCommitterEmail    string
 	watchModeReconcileInterval time.Duration
 }
 
@@ -435,10 +428,6 @@ func parseFlagsWithArgs(fs *flag.FlagSet, args []string) (appConfig, error) {
 	fs.StringVar(&cfg.captureMode, "capture-mode", "audit",
 		"Event capture mode: 'audit' (default, requires kube-apiserver audit webhook + Valkey/Redis) "+
 			"or 'watch' (uses native Kubernetes informers, no Redis or audit webhook required).")
-	fs.StringVar(&cfg.watchModeCommitterName, "watch-mode-committer-name", "gitops-reverser",
-		"Git committer name for watch-mode commits (used when --capture-mode=watch).")
-	fs.StringVar(&cfg.watchModeCommitterEmail, "watch-mode-committer-email", "gitops-reverser@local",
-		"Git committer email for watch-mode commits (used when --capture-mode=watch).")
 	fs.DurationVar(&cfg.watchModeReconcileInterval, "watch-mode-reconcile-interval", defaultWatchModeReconcileInterval,
 		"How often to force a full re-snapshot in watch mode to recover missed events (0 disables).")
 	cfg.zapOpts = zap.Options{

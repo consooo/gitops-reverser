@@ -86,7 +86,7 @@ func (m *Manager) startWatchModeInformerForType(ctx context.Context, log logr.Lo
 		return
 	}
 
-	informerCtx, cancel := context.WithCancel(ctx) //nolint:gosec // stored and called by stopWatchModeInformerForType
+	informerCtx, cancel := context.WithCancel(ctx) // cancel stored in watchInformers, called by stopWatchModeInformerForType
 	m.watchInformers[gvr] = cancel
 
 	go m.runWatchModeInformer(informerCtx, log, dc, gvr)

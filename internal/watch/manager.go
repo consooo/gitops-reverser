@@ -382,9 +382,9 @@ func (m *Manager) NeedLeaderElection() bool {
 	return true
 }
 
-// dynamicClientFromConfig builds a dynamic client from the controller's REST config.
-// If m.dynamicClient is set (e.g. in tests) it is returned directly. It is used by the
-// per-type checkpoint fill (mirrorTypeObjects) — the only API touch on a schedule.
+// dynamicClientFromConfig returns a dynamic client, building and caching one from the REST config
+// on first call. If m.dynamicClient is already set (test seam or prior call) it is returned
+// directly, so all callers share a single HTTP transport.
 func (m *Manager) dynamicClientFromConfig(log logr.Logger) dynamic.Interface {
 	if m.dynamicClient != nil {
 		return m.dynamicClient
@@ -399,6 +399,7 @@ func (m *Manager) dynamicClientFromConfig(log logr.Logger) dynamic.Interface {
 		log.Error(err, "failed to construct dynamic client for seed")
 		return nil
 	}
+	m.dynamicClient = dc
 	return dc
 }
 

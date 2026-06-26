@@ -185,29 +185,32 @@ func (r *EventRouter) resolveWorkerForGitDest(
 	return worker, nil
 }
 
-// EmitTypeReconcileForGitDest runs one per-type reconcile by SPLICING the materialized API in
-// Redis (checkpoint + log) into that type's desired set and enqueuing a type-scoped resync (upserts
-// the type's objects, sweeps only the type's orphans) — the R2 pivot. It replaces the live
-// per-reconcile streaming gather with a fold over Redis, so a reconcile makes ZERO API calls and N
-// GitTargets fan out from one capture. It is fire-and-forget — the worker reply is drained in the
-// background — so the wake goroutine never blocks on a commit.
+// EmitTypeReconcileForGitDest runs one per-type reconcile: it computes the type's desired set and
+// enqueues a type-scoped resync (upserts the type's objects, sweeps only the type's orphans).
+// In audit mode it reads from the Redis materialization (checkpoint + log) via SpliceSnapshotForType
+// — zero per-reconcile API calls, N GitTargets fan out from one capture. In watch mode it performs
+// a direct cluster LIST via WatchModeSnapshotForType.
 //
-// It is self-gating and idempotent (the splice is a pure function of checkpoint + log), so it is
-// safe to call from every wake: a type-activation edge, the materializer's TypeSynced, and an audit
-// arrival. When the splice holds — the GitTarget does not watch the type, or its checkpoint is not
-// yet Synced (§7 fail-closed) — it no-ops without enqueuing. A genuine fail-closed condition (an
-// unobserved surface, a wobbling type, or a Redis/splice failure) is returned as an error.
-// The heal flag marks a non-urgent drift-correcting re-anchor (a periodic sweep or late-event
-// nudge after the audit tail is already live): the worker DEFERS it while a commit window is open
-// rather than force-finalizing (stealing) it (Rec 1 / the 8f2ad84 regression). A first-sync backfill
-// passes heal=false — it must establish initial state promptly and is ordered before the tail.
+// It is self-gating and idempotent, so it is safe to call from every wake. When the snapshot holds
+// — the GitTarget does not watch the type, or (audit mode) its checkpoint is not yet Synced — it
+// no-ops without enqueuing. A genuine fail-closed condition is returned as an error.
+// The heal flag marks a non-urgent drift-correcting re-anchor: the worker DEFERS it while a commit
+// window is open rather than force-finalizing (Rec 1 / the 8f2ad84 regression). A first-sync
+// backfill passes heal=false.
 func (r *EventRouter) EmitTypeReconcileForGitDest(
 	ctx context.Context,
 	gitDest types.ResourceReference,
 	gvr schema.GroupVersionResource,
 	heal bool,
 ) error {
-	snapshot, ready, err := r.WatchManager.SpliceSnapshotForType(ctx, gitDest, gvr)
+	var snapshot ClusterSnapshot
+	var ready bool
+	var err error
+	if r.WatchManager.WatchModeEnabled() {
+		snapshot, ready, err = r.WatchManager.WatchModeSnapshotForType(ctx, gitDest, gvr)
+	} else {
+		snapshot, ready, err = r.WatchManager.SpliceSnapshotForType(ctx, gitDest, gvr)
+	}
 	if err != nil {
 		return err
 	}

@@ -188,8 +188,7 @@ func main() {
 	// Set EventRouter reference in WatchManager
 	watchMgr.EventRouter = eventRouter
 
-	// Wire watch-mode committer and reconcile interval. Only active when WatchModeEnabled()
-	// returns true (TypeSplicer == nil); harmless no-ops in audit mode.
+	watchMgr.WatchMode = isWatchMode
 	watchMgr.WatchModeCommitter = git.UserInfo{
 		Username:    cfg.watchModeCommitterName,
 		DisplayName: cfg.watchModeCommitterName,

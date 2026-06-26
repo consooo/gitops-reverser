@@ -20,7 +20,6 @@ package watch
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -55,17 +54,8 @@ func (m *Manager) SpliceSnapshotForType(
 ) (ClusterSnapshot, bool, error) {
 	log := m.Log.WithValues("gitDest", gitDest.String(), "gvr", gvr.String())
 
-	// In watch mode (TypeSplicer == nil AND EventRouter != nil) fall through to a direct cluster LIST
-	// instead of reading from Redis. The same scope resolution and object projection are used so the
-	// desired set is shaped identically to the spliced path.
-	// If TypeSplicer is nil but watch mode is not enabled, that is a misconfiguration — return an error
-	// so the caller holds rather than silently reconciling nothing.
 	if m.TypeSplicer == nil {
-		if !m.WatchModeEnabled() {
-			return ClusterSnapshot{}, false,
-				errors.New("no TypeSplicer configured and watch mode is not enabled (EventRouter is nil)")
-		}
-		return m.watchModeSnapshotForType(ctx, gitDest, gvr)
+		return ClusterSnapshot{}, false, fmt.Errorf("no type splicer wired for %s", gvr.String())
 	}
 
 	// Same fail-closed scope resolution the streaming path uses: refuses (error) on an unobserved
@@ -119,13 +109,12 @@ func scopeAndProjectSplicedObjects(
 	return desired
 }
 
-// watchModeSnapshotForType computes one type's current desired set by doing a direct dynamic-client
-// LIST against the cluster (no Redis). It is the watch-mode twin of SpliceSnapshotForType: it reuses
-// the same scope resolution and DesiredResource projection, but skips the materialization phase gate
-// (there are no checkpoints in watch mode). The returned Revision and CoverageHead are set to the
-// list's resourceVersion; the CoverageHead is not consulted by the informer tail path so its exact
-// format does not matter for watch mode correctness.
-func (m *Manager) watchModeSnapshotForType(
+// WatchModeSnapshotForType computes one type's current desired set by doing a direct dynamic-client
+// LIST against the cluster (no Redis). It is the watch-mode equivalent of SpliceSnapshotForType:
+// it reuses the same scope resolution and DesiredResource projection, but skips the materialization
+// phase gate (there are no Redis checkpoints in watch mode). Called by the EventRouter instead of
+// SpliceSnapshotForType when Manager.WatchMode is true.
+func (m *Manager) WatchModeSnapshotForType(
 	ctx context.Context,
 	gitDest types.ResourceReference,
 	gvr schema.GroupVersionResource,

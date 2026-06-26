@@ -57,9 +57,12 @@ func (m *Manager) startTypeLifecycleConsumer(ctx context.Context, log logr.Logge
 		// events and lists ONLY claimed types into the checkpoint keyspace, off the
 		// Materializer's dispatch (observers must not block). The Materializer's gate is fed
 		// from handleTypeLifecycleEvent below.
-		m.materializationWork = make(chan typeset.MaterializationEvent, materializationWorkBuffer)
-		m.materializerInstance().Subscribe(m.enqueueMaterializationWork)
-		go m.driveMaterialization(ctx, log)
+		// Skipped in watch mode: there are no Redis checkpoints to maintain.
+		if !m.WatchMode {
+			m.materializationWork = make(chan typeset.MaterializationEvent, materializationWorkBuffer)
+			m.materializerInstance().Subscribe(m.enqueueMaterializationWork)
+			go m.driveMaterialization(ctx, log)
+		}
 
 		log.V(1).Info("type-lifecycle consumer started")
 	})
@@ -123,7 +126,9 @@ func (m *Manager) drainTypeLifecycleEvents(ctx context.Context, log logr.Logger)
 // checkpoint is Synced (§7) — so no separate readiness gate is needed. Wobbling/Recovered/
 // Refused carry no git action here.
 func (m *Manager) handleTypeLifecycleEvent(ctx context.Context, log logr.Logger, ev typeset.LifecycleEvent) {
-	m.materializerInstance().OnLifecycleEvent(ev)
+	if !m.WatchMode {
+		m.materializerInstance().OnLifecycleEvent(ev)
+	}
 
 	switch ev.Kind {
 	case typeset.TypeActivated:

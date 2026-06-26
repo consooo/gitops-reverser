@@ -184,6 +184,11 @@ type Manager struct {
 	// release cleanup. Best-effort — a delete failure is logged, never fatal.
 	AuditKeyDeleter TypeKeyDeleter
 
+	// WatchMode enables native Kubernetes informer-based event capture (no Redis/audit webhook).
+	// Set to true when --capture-mode=watch. When true the Materializer checkpoint machinery is
+	// skipped and snapshots are taken via direct cluster LISTs instead of Redis splice reads.
+	WatchMode bool
+
 	// TypeSplicer serves the api-source-of-truth splice (R2): SpliceSnapshotForType reads the
 	// per-type checkpoint + log through it to compute desired state with zero per-reconcile API
 	// calls. Nil means the splice consumer is not wired (the per-type reconcile then holds).
@@ -316,10 +321,11 @@ func (m *Manager) Start(ctx context.Context) error {
 	// registry Update, so cold-start activations drive the per-type reconcile path.
 	m.startTypeLifecycleConsumer(ctx, log.WithName("type-lifecycle"))
 
-	// Tick the demand-axis sweep so withdrawn leases age out (DEC-L5). It is independent of
-	// the followability consumer above: a GitTarget renews its claims every reconcile, this
-	// pass releases whatever stopped being renewed since the previous tick.
-	m.startMaterializationSweep(ctx, log.WithName("materialization"))
+	// Tick the demand-axis sweep so withdrawn leases age out (DEC-L5). Not needed in watch mode
+	// (the Materializer checkpoint machinery is skipped entirely).
+	if !m.WatchMode {
+		m.startMaterializationSweep(ctx, log.WithName("materialization"))
+	}
 
 	if err := m.bootstrapRuleStore(ctx, log.WithName("bootstrap")); err != nil {
 		log.Error(err, "RuleStore bootstrap failed, continuing with current in-memory state")

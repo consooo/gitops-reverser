@@ -27,9 +27,8 @@ package watch
 //   - TypeActivated → startWatchModeInformerForType: informer started for that GVR.
 //   - TypeRemoved   → stopWatchModeInformerForType: informer cancelled and evicted.
 //
-// Watch mode is enabled when WatchModeEnabled() returns true (TypeSplicer == nil and
-// EventRouter != nil). In audit mode this file is a no-op: every exported method returns
-// immediately when WatchModeEnabled() is false.
+// Watch mode is enabled when Manager.WatchMode is true (set from --capture-mode=watch in cmd).
+// In audit mode this file is a no-op: every method returns immediately when WatchMode is false.
 
 import (
 	"context"
@@ -47,10 +46,9 @@ import (
 	"github.com/ConfigButler/gitops-reverser/internal/types"
 )
 
-// WatchModeEnabled reports whether watch mode is active: TypeSplicer is nil (no Redis splice)
-// and an EventRouter is wired (events have somewhere to go).
+// WatchModeEnabled reports whether watch mode is active.
 func (m *Manager) WatchModeEnabled() bool {
-	return m.TypeSplicer == nil && m.EventRouter != nil
+	return m.WatchMode
 }
 
 // startWatchModeInformers starts informers for all currently active GVRs. Called once at
